@@ -1,265 +1,291 @@
 
 import { getSession, unauthorized } from "../../../lib/auth";
-import { TYPES, INTERESTS } from "../../../lib/constants";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const LANGUAGES = ["Bangla", "Banglish", "English"];
-const CATEGORIES = [
-  "Sales",
-  "Support",
-  "Job Seeker",
-  "Spam",
-  "Other"
+const TIMEOUT_MS = 60000;
+
+const INTERESTS = [
+  "Bootcamp",
+  "Fellowship",
+  "Corporate Training",
+  "Unknown"
 ];
-const STATUSES = [
-  "New",
-  "Contacted",
-  "Interested",
-  "Paid",
-  "Lost"
+
+const LANGUAGES = [
+  "Bangla",
+  "Banglish",
+  "English"
 ];
-const PRIORITIES = ["High", "Medium", "Low"];
-const SENTIMENTS = ["Positive", "Neutral", "Negative"];
 
-const safeString = (value, maxLength = 1000) =>
-  typeof value === "string" ? value.slice(0, maxLength) : "";
+function parseJSON(value) {
+  if (typeof value !== "string") return value;
 
-function parseAIResponse(result) {
-  let data = Array.isArray(result) ? result[0] : result;
+  const text = value
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
 
-  if (data && typeof data === "object" && "output" in data) {
-    data = data.output;
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }
+}
+
+function unwrap(value) {
+  let result = value;
+
+  for (let i = 0; i < 6; i++) {
+    if (typeof result === "string") {
+      result = parseJSON(result);
+      continue;
+    }
+
+    if (Array.isArray(result)) {
+      result = result[0];
+      continue;
+    }
+
+    if (!result || typeof result !== "object") {
+      return null;
+    }
+
+    if (result.name || result.reply ||
+        result.suggestedReply || result.interest) {
+      return result;
+    }
+
+    const nested =
+      result.output ??
+      result.data ??
+      result.result ??
+      result.response ??
+      result.json;
+
+    if (nested === undefined) {
+      return result;
+    }
+
+    result = nested;
   }
 
-  if (typeof data === "string") {
-    data = JSON.parse(
-      data.replace(/```json|```/gi, "").trim()
-    );
+  return result && typeof result === "object"
+    ? result
+    : null;
+}
+
+function safe(value, limit = 3000) {
+  return typeof value === "string"
+    ? value.slice(0, limit)
+    : "";
+}
+
+function normalizeInterest(value) {
+  const text = safe(value, 100).toLowerCase();
+
+  if (text.includes("bootcamp")) return "Bootcamp";
+  if (text.includes("fellowship")) return "Fellowship";
+
+  if (text.includes("corporate") ||
+      text.includes("training")) {
+    return "Corporate Training";
   }
 
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
-    throw new Error("Invalid n8n response format");
+  return "Unknown";
+}
+
+function normalizeLanguage(value) {
+  const text = safe(value, 50).toLowerCase();
+
+  if (text === "bangla" || text === "bengali") {
+    return "Bangla";
   }
 
-  return data;
+  if (text === "banglish") return "Banglish";
+
+  return "English";
 }
 
 export async function POST(req) {
-  // Verify the anonymous CRM session.
   const session = await getSession(req);
 
-  if (!session) {
-    return unauthorized();
-  }
+  if (!session) return unauthorized();
 
   try {
-    const body = await req.json().catch(() => null);
+    const input = await req.json().catch(() => null);
 
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return Response.json(
-        { error: "Invalid JSON request body" },
-        { status: 400 }
-      );
-    }
-
-    const { message, source = "Other" } = body;
+    const message = input?.message;
+    const source = input?.source || "Other";
 
     if (
       typeof message !== "string" ||
-      !message.trim() ||
-      message.length > 6000
+      !message.trim()
     ) {
       return Response.json(
-        { error: "Message must be 1-6000 characters" },
+        { error: "Customer message is required." },
         { status: 400 }
       );
     }
 
-    if (typeof source !== "string" || source.length > 100) {
+    const webhook = process.env.N8N_WEBHOOK_URL;
+    const secret = process.env.N8N_WEBHOOK_SECRET;
+
+    if (!webhook || !secret) {
       return Response.json(
-        { error: "Invalid source" },
-        { status: 400 }
+        { error: "n8n configuration is missing." },
+        { status: 500 }
       );
     }
 
-    const webhookUrl = process.env.N8N_WEBHOOK_URL;
-    const webhookSecret = process.env.N8N_WEBHOOK_SECRET;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      TIMEOUT_MS
+    );
 
-    if (!webhookUrl || !webhookSecret) {
-      return Response.json(
-        { error: "n8n webhook configuration missing" },
-        { status: 503 }
-      );
-    }
-
-    // Validate webhook destination.
-    let parsedUrl;
+    let response;
 
     try {
-      parsedUrl = new URL(webhookUrl);
-    } catch {
-      return Response.json(
-        { error: "Invalid n8n webhook URL" },
-        { status: 503 }
-      );
+      response = await fetch(webhook, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CRM-SECRET": secret
+        },
+        body: JSON.stringify({
+          message: message.trim().slice(0, 6000),
+          source,
+          sessionId: session.id
+        }),
+        signal: controller.signal,
+        cache: "no-store"
+      });
+    } finally {
+      clearTimeout(timeout);
     }
 
-    if (
-      parsedUrl.protocol !== "https:" ||
-      parsedUrl.hostname !== "biaicrm.app.n8n.cloud"
-    ) {
-      return Response.json(
-        { error: "Unexpected n8n webhook destination" },
-        { status: 503 }
-      );
-    }
-
-    // Send customer message to n8n.
-    const response = await fetch(webhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-
-        // Must match n8n Header Auth credential Name.
-        "X-CRM-SECRET": webhookSecret
-      },
-      body: JSON.stringify({
-        message: message.trim(),
-        source: source.trim() || "Other"
-      }),
-      signal: AbortSignal.timeout(60000),
-      cache: "no-store"
-    });
+    const raw = await response.text();
 
     if (!response.ok) {
-      console.error("n8n request failed:", {
+      console.error("n8n HTTP error:", {
         status: response.status,
-        statusText: response.statusText
+        body: raw.slice(0, 1000)
       });
 
       return Response.json(
         {
-          error: "n8n workflow request failed",
+          error: "n8n workflow request failed.",
           upstreamStatus: response.status
         },
         { status: 502 }
       );
     }
 
-    const result = await response.json();
-    const data = parseAIResponse(result);
+    const parsed = parseJSON(raw);
+    const result = unwrap(parsed);
 
-    if (
-      data.processingStatus === "error" ||
-      !CATEGORIES.includes(data.category)
-    ) {
-      throw new Error("Invalid AI classification");
+    if (!result) {
+      console.error(
+        "Invalid n8n response:",
+        raw.slice(0, 1000)
+      );
+
+      return Response.json(
+        { error: "n8n returned invalid AI data." },
+        { status: 502 }
+      );
     }
 
-    const category = data.category;
-
-    const legacyType =
-      category === "Job Seeker" ? "Job" : category;
-
-    const type = TYPES.includes(legacyType)
-      ? legacyType
-      : "Other";
-
-    const interest = INTERESTS.includes(data.interest)
-      ? data.interest
-      : "Unknown";
-
-    const language = LANGUAGES.includes(data.language)
-      ? data.language
-      : "English";
-
-    const status =
-      category === "Sales" && STATUSES.includes(data.status)
-        ? data.status
-        : "New";
-
-    const suggestedReply = safeString(
-      data.suggestedReply || data.reply,
+    const reply = safe(
+      result.reply ||
+      result.suggestedReply ||
+      result.suggested_reply ||
+      "",
       3000
     );
 
-    const summary = safeString(
-      data.summary || data.reason,
-      1000
+    if (!reply.trim()) {
+      console.error(
+        "AI reply missing:",
+        JSON.stringify(result).slice(0, 1000)
+      );
+
+      return Response.json(
+        {
+          error:
+            "AI analysis completed but suggested reply is missing."
+        },
+        { status: 502 }
+      );
+    }
+
+    const interest = normalizeInterest(
+      result.interest || result.program
     );
 
-    const followUpRequired =
-      data.followUpRequired === true;
+    const language = normalizeLanguage(
+      result.language
+    );
 
-    const followUpAfterHours =
-      followUpRequired &&
-      typeof data.followUpAfterHours === "number" &&
-      Number.isFinite(data.followUpAfterHours)
-        ? Math.max(0, data.followUpAfterHours)
-        : 0;
+    return Response.json({
+      name: safe(
+        result.name || result.customerName,
+        150
+      ),
 
-    const output = {
-      name: safeString(data.name, 150),
-      phone: safeString(data.phone, 50),
+      phone: safe(
+        result.phone || result.phoneNumber,
+        50
+      ),
 
-      source: source.trim() || "Other",
-      category,
-      type,
+      source,
+      message,
+
+      type: "Sales",
       interest,
       language,
-      status,
 
-      intent: safeString(data.intent, 200),
-      priority: PRIORITIES.includes(data.priority)
-        ? data.priority
-        : "Medium",
+      status: "New",
 
-      sentiment: SENTIMENTS.includes(data.sentiment)
-        ? data.sentiment
-        : "Neutral",
+      reply,
+      suggestedReply: reply,
+      replyStatus: "Reply Ready",
 
-      reply: suggestedReply,
-      suggestedReply,
+      summary: safe(result.summary, 1000),
+      notes: safe(result.notes, 3000),
 
-      reason: summary,
-      summary,
-
-      followUpRequired,
-      followUpAfterHours,
-
-      needsHumanReview:
-        data.needsHumanReview === true,
-
-      processingStatus: "success"
-    };
-
-    return Response.json(output, {
-      status: 200,
-      headers: {
-        "Cache-Control": "no-store"
-      }
+      priority: ["High", "Medium", "Low"].includes(
+        result.priority
+      )
+        ? result.priority
+        : "Medium"
     });
 
   } catch (error) {
-    console.error("CRM analysis error:", error.message);
+    console.error("Analyze API error:", error);
+
+    const timedOut = error.name === "AbortError";
 
     return Response.json(
       {
-        error: "AI processing failed",
-        detail:
-          process.env.NODE_ENV === "development"
-            ? error.message
-            : undefined
+        error: timedOut
+          ? "n8n request timed out."
+          : "Unable to connect to n8n workflow."
       },
-      {
-        status:
-          error.name === "TimeoutError" ||
-          error.name === "AbortError"
-            ? 504
-            : 502
-      }
+      { status: timedOut ? 504 : 502 }
     );
   }
 }
