@@ -46,6 +46,3 @@ A functional Next.js + Firebase Firestore + Gemini AI CRM for the **20 fictional
 - Verify missing phone stays blank and AI does not invent a price.
 - Verify invalid admin secret rejects access.
 
-## Loom outline (<5 minutes)
-
-0:00 Problem, 0:35 dashboard, 1:00 CSV import, 1:35 AI Banglish analysis, 2:30 support/spam handling, 3:20 pipeline/follow-up, 4:05 architecture/limitations.
